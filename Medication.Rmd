@@ -1,0 +1,131 @@
+---
+title: "Medication"
+author: "Grace Brooks"
+date: "2026-03-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Load necessary libraries
+library(dplyr)
+library(tidyverse)
+library(tidyr)
+library(readr)
+library(ggplot2)
+```
+
+```{r}
+# load in csv files with necessary data
+baseline <- read_csv("...\\Study Team Eligibility Form.csv")
+followup <- read_csv("...\\Medical History Follow-up (12W,.csv")
+
+# THRIVE Randomization and Baseline BP were loaded into R environment manually
+
+# change caselabel column to Case in randomization data (already loaded)
+THRIVE_Randomization_Data <- THRIVE_Randomization_Data %>%
+  rename(Case = caselabel)
+```
+
+```{r}
+# remove unnecessary columns from baseline and followup data
+baseline <- baseline %>%
+  select(Case, eligibilitybl_exclusionmedications, eligibilitybl_exclusionmedsdm, eligibilitybl_exclusionmedsdmtype, eligibilitybl_exclusionmedsktype, eligibilitybl_exclusionmedsktype_note)
+
+followup <- followup %>%
+  select(Case, medhistfu_event, medhistfu_htnmeds, medhistfu_hbpmeds, medhistfu_hbpmedcount, medhistfu_hbpmedname)
+
+# add randomization data to baseline and followup data
+baseline <- baseline %>%
+  left_join(THRIVE_Randomization_Data, by = "Case")
+followup <- followup %>%
+  left_join(THRIVE_Randomization_Data, by = "Case")
+```
+
+```{r}
+# look at baseline data for each group
+baseline_control <- baseline %>%
+  filter(Randomization == "THRIVE Control")
+baseline_treatment <- baseline %>%
+  filter(Randomization == "THRIVE Intervention")
+```
+
+```{r}
+# subset blood pressure
+Blood_Pressure_Measurement_Form <- Blood_Pressure_Measurement_Form %>%
+  select(Case, bp_event)
+
+# merge with randomization data
+Blood_Pressure_Measurement_Form <- Blood_Pressure_Measurement_Form %>%
+  left_join(THRIVE_Randomization_Data, by = "Case")
+
+# subset medication data to two groups: intervention and control
+bp_control <- Blood_Pressure_Measurement_Form %>%
+  filter(Randomization == "THRIVE Control")
+bp_treatment <- Blood_Pressure_Measurement_Form %>%
+  filter(Randomization == "THRIVE Intervention")
+
+# subset to only include baseline
+bp_control_baseline <- bp_control %>%
+  filter(bp_event == "Baseline")
+bp_treatment_baseline <- bp_treatment %>%
+  filter(bp_event == "Baseline")
+```
+
+```{r}
+# look at medication for each follow up and arm
+control_12W <- followup %>%
+  filter(Randomization == "THRIVE Control", medhistfu_event == "12W")
+treatment_12W <- followup %>%
+  filter(Randomization == "THRIVE Intervention", medhistfu_event == "12W")
+control_24W <- followup %>%
+  filter(Randomization == "THRIVE Control", medhistfu_event == "24W")
+treatment_24W <- followup %>%
+  filter(Randomization == "THRIVE Intervention", medhistfu_event == "24W")
+```
+
+```{r}
+# build 2x2 tables and calculate p-values using fishers exact test
+
+# baseline
+bl_table <- matrix(c(
+  0, 2,   # medication counts for control and intervention
+  37, 38  # Non-event counts for control and intervention
+), nrow = 2, byrow = TRUE)
+
+rownames(bl_table) <- c("Meds", "No Meds")
+colnames(bl_table) <- c("Control", "Intervention")
+
+bl_table
+
+fisher.test(bl_table, alternative = "two.sided")
+
+# 12W
+fu12W_table <- matrix(c(
+  3, 5,   # medication counts for control and intervention
+  26, 15  # Non-event counts for control and intervention
+), nrow = 2, byrow = TRUE)
+
+rownames(fu12W_table) <- c("Meds", "No Meds")
+colnames(fu12W_table) <- c("Control", "Intervention")
+
+fu12W_table
+
+fisher.test(fu12W_table, alternative = "two.sided")
+
+# 24W
+fu24W_table <- matrix(c(
+  12, 16,   # medication counts for control and intervention
+  17, 10  # Non-event counts for control and intervention
+), nrow = 2, byrow = TRUE)
+
+rownames(fu24W_table) <- c("Meds", "No Meds")
+colnames(fu24W_table) <- c("Control", "Intervention")
+
+fu24W_table
+
+fisher.test(fu24W_table, alternative = "two.sided")
+```
