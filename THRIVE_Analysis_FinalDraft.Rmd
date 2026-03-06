@@ -139,6 +139,14 @@ medication_visits <- bind_rows(
   followup %>% select(caselabel, bp_event, bp_med_followup) %>%
     rename(bp_med = bp_med_followup)
 )
+
+medication_visits <- medication_visits %>%
+  mutate(
+    bp_event = factor(bp_event,
+                      levels = c("Baseline", "12W", "24W"))
+  ) %>%
+  left_join(thrive_random %>% select(caselabel, Randomization), by = "caselabel") %>%
+  filter(!is.na(Randomization))
 ```
 
 ```{r bp med cleaning 3}
@@ -151,12 +159,13 @@ df <- df %>%
 
 # check if numbers match up with Grace's table
 medication_visits %>%
-  group_by(bp_event) %>%
+  group_by(bp_event, Randomization) %>%
   summarise(
     n_on_med = sum(bp_med == 1, na.rm = TRUE),
     n_total = n(),
     percent = 100 * n_on_med / n_total
-  )
+  ) %>% 
+  arrange(bp_event)
 ```
 
 ## DASH Adherence Score
