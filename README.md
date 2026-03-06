@@ -6,5 +6,5 @@ This repository consists of all code used in the statistical analyses for the TH
 
 There were three main aims:
   1. Update Table 1 with medication information
-  2. Create GEE and LMM Models
+  2. Verify results with LMM Models and medication use
   3. Investigate the missingness within the data set
