@@ -1,0 +1,692 @@
+---
+title: "THRIVE Analysis Final Draft"
+author: "Amia Graye"
+output: html_document
+date: "2026-03-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setup
+
+```{r libraries}
+# load the libraries
+library(readr)
+library(readxl)
+library(dplyr)
+library(lme4)
+library(lmerTest)
+library(ggplot2)
+library(tidyr)
+library(mice)
+library(geepack)
+library(stringr)
+library(emmeans)
+```
+
+```{r data}
+# load the data
+dash_drs <- read_csv("Desktop/JHU HW/Consulting_Data/Data/DASH Rapid Screener (DRS).csv")
+bp_meas <- read_csv("Desktop/JHU HW/Consulting_Data/Data/Blood Pressure Measurement Form.csv")
+thrive_random <- read_excel("Desktop/JHU HW/Consulting_Data/Data/THRIVE Randomization Data.xlsx")
+lab_results <- read_csv("Desktop/JHU HW/Consulting_Data/Data/Laboratory Results_updated.csv")
+elig <- read.csv("~/Desktop/JHU HW/Consulting_Data/Data/Study Team Eligibility Form.csv")
+med_history <- read.csv("~/Desktop/JHU HW/Consulting_Data/Data/Medical History Follow-up (12W,.csv")
+fim04 <- read.delim("~/Desktop/JHU HW/Consulting_Data/Data/FIMrecalls04.txt")
+demo <- read_csv("Desktop/JHU HW/Consulting_Data/Data/Sociodemographic Questionnaire .csv")
+bp_drugs <- read_excel("Desktop/JHU HW/Consulting_Data/Data/nhanes_antihypertensives_2017_2020_ss_edit_RO.xlsx")
+
+# change the data locations for your specific computer
+```
+
+# Cleaning
+
+## Blood Pressure Measurements
+
+```{r bp meas cleaning}
+# clean the blood pressure data
+df <- bp_meas %>%
+  select(Case, bp_event, bp_avgsbp, bp_avgdbp) %>%
+  rename(caselabel = Case) %>%
+  left_join(thrive_random, by = "caselabel") %>%
+  mutate(
+    bp_event = factor(bp_event,
+                      levels = c("Baseline", "12W", "24W"))
+  ) %>%
+  filter(!is.na(Randomization))
+```
+
+## Blood Pressure Medications
+
+```{r bp med cleaning}
+# clean the blood pressure medication data
+# change names of dataset to match Grace's code
+baseline <- elig
+followup <- med_history
+
+# change caselabel column to Case in randomization data (already loaded)
+THRIVE_Randomization_Data <- thrive_random %>%
+  rename(Case = caselabel) 
+
+# remove unnecessary columns from baseline and followup data
+baseline <- baseline %>%
+  select(Case, eligibilitybl_exclusionmedications, eligibilitybl_exclusionmedsdm, eligibilitybl_exclusionmedsdmtype, eligibilitybl_exclusionmedsktype, eligibilitybl_exclusionmedsktype_note) 
+
+followup <- followup %>%
+  select(Case, medhistfu_event, medhistfu_htnmeds, medhistfu_hbpmeds, medhistfu_hbpmedcount, medhistfu_hbpmedname) %>%
+  rename(bp_event = medhistfu_event)
+
+# add randomization data to baseline and followup data
+baseline <- baseline %>%
+  left_join(THRIVE_Randomization_Data, by = "Case") %>%
+  rename(caselabel = Case)
+followup <- followup %>%
+  left_join(THRIVE_Randomization_Data, by = "Case") %>%
+  rename(caselabel = Case)
+```
+
+```{r bp med cleaning 2}
+# create vector of all meds used for hypertension treatment in the dataset
+bp_drug_names <- bp_drugs %>%
+  filter(`Used for Hypertension treatment` == "Yes") %>%
+  pull(RXDDRUG) %>%
+  str_to_upper()
+
+# convert meds in baseline and followup to uppercase
+baseline <- baseline %>%
+  mutate(
+    med_name = str_to_upper(eligibilitybl_exclusionmedsktype_note)
+  )
+
+followup <- followup %>%
+  mutate(
+    med_name = str_to_upper(medhistfu_hbpmedname)
+  )
+
+# create baseline bp indicator variable
+baseline <- baseline %>%
+  mutate(
+    bp_med_baseline =
+      ifelse(
+        eligibilitybl_exclusionmedsktype == "Yes" &
+        str_detect(med_name, str_c(bp_drug_names, collapse = "|")),
+        1, 0
+      )
+  )
+
+# create followup bp indicator variable
+followup <- followup %>%
+  mutate(
+    bp_med_followup =
+      ifelse(
+        (medhistfu_htnmeds == "Yes" | medhistfu_hbpmeds == "Yes") &
+        str_detect(med_name, str_c(bp_drug_names, collapse = "|")),
+        1, 0
+      )
+  )
+
+# add indictor for baseline visit
+baseline <- baseline %>%
+  mutate(bp_event = "Baseline")
+
+# combine the baseline and followup datasets
+medication_visits <- bind_rows(
+  baseline %>% select(caselabel, bp_event, bp_med_baseline) %>%
+    rename(bp_med = bp_med_baseline),
+
+  followup %>% select(caselabel, bp_event, bp_med_followup) %>%
+    rename(bp_med = bp_med_followup)
+)
+```
+
+```{r bp med cleaning 3}
+# combine medication data with main dataset
+df <- df %>%
+  left_join(medication_visits, by = c("caselabel", "bp_event")) %>%
+  mutate(
+    bp_med = ifelse(is.na(bp_med), 0, bp_med)
+  )
+
+# check if numbers match up with Grace's table
+medication_visits %>%
+  group_by(bp_event) %>%
+  summarise(
+    n_on_med = sum(bp_med == 1, na.rm = TRUE),
+    n_total = n(),
+    percent = 100 * n_on_med / n_total
+  )
+```
+
+## DASH Adherence Score
+
+```{r dash cleaning}
+first_non_missing_chr <- function(x) {
+  x <- as.character(x)
+  x <- x[!is.na(x) & x != ""]
+  if (length(x) == 0) return(NA_character_)
+  x[[1]]
+}
+
+first_non_missing_num <- function(x) {
+  x <- as.numeric(x)
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_real_)
+  x[[1]]
+}
+
+safe_mean <- function(x) {
+  x <- as.numeric(x)
+  if (all(is.na(x))) return(NA_real_)
+  mean(x, na.rm = TRUE)
+}
+
+score_mellen <- function(v, full, mid, direction = c("low", "high")) {
+  direction <- match.arg(direction)
+  if (direction == "low") {
+    ifelse(is.na(v), NA_real_, ifelse(v <= full, 1, ifelse(v <= mid, 0.5, 0)))
+  } else {
+    ifelse(is.na(v), NA_real_, ifelse(v >= full, 1, ifelse(v >= mid, 0.5, 0)))
+  }
+}
+```
+
+```{r dash cleaning 2}
+# Randomized ITT cohort
+rand <- thrive_random %>%
+  clean_names() %>%
+  transmute(
+    case = as.character(caselabel),
+    arm_raw = as.character(randomization),
+    arm = case_when(
+      stringr::str_detect(arm_raw, "Intervention") ~ "Intervention",
+      TRUE ~ "Control"
+    )
+  ) %>%
+  mutate(arm = factor(arm, levels = c("Control", "Intervention"))) %>%
+  select(case, arm) %>%
+  distinct()
+
+stopifnot(n_distinct(rand$case) == 80L)
+
+# Baseline covariates from sociodemographic form
+Sociodemographic_Questionnaire <- read_csv("Desktop/JHU HW/Consulting_Data/Data/Sociodemographic Questionnaire .csv")
+sd <- Sociodemographic_Questionnaire %>%
+  clean_names() %>%
+  transmute(
+    case = as.character(case),
+    demo_age,
+    demo_sexatbirth,
+    demo_ishispaniclatino
+  ) %>%
+  group_by(case) %>%
+  summarise(
+    age = first_non_missing_num(demo_age),
+    sex = first_non_missing_chr(demo_sexatbirth),
+    hispanic = first_non_missing_chr(demo_ishispaniclatino),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    sex = factor(if_else(sex %in% c("Female", "Male"), sex, NA_character_), levels = c("Female", "Male")),
+    hispanic = factor(if_else(hispanic %in% c("No", "Yes"), hispanic, NA_character_), levels = c("No", "Yes"))
+  )
+
+# SBP outcomes
+Blood_Pressure_Measurement_Form <- read_csv("Desktop/JHU HW/Consulting_Data/Data/Blood Pressure Measurement Form.csv")
+bp_long <- Blood_Pressure_Measurement_Form  %>%
+  clean_names() %>%
+  transmute(
+    case = as.character(case),
+    visit = as.character(bp_event),
+    sbp = rowMeans(cbind(bp_sbp1, bp_sbp2, bp_sbp3), na.rm = TRUE)
+  ) %>%
+  mutate(sbp = if_else(is.nan(sbp), NA_real_, sbp)) %>%
+  filter(case %in% rand$case, visit %in% c("Baseline", "12W", "24W")) %>%
+  group_by(case, visit) %>%
+  summarise(sbp = first_non_missing_num(sbp), .groups = "drop")
+
+sbp_wide <- bp_long %>%
+  pivot_wider(names_from = visit, values_from = sbp) %>%
+  rename(
+    sbp_bl = Baseline,
+    sbp_12 = `12W`,
+    sbp_24 = `24W`
+  )
+
+# DASH nutrient score (Mellen): recall-level from FIMrecalls04
+visit_map <- c("0" = "Baseline", "12" = "12W", "24" = "24W")
+FIMrecalls04 <- read.delim("~/Desktop/JHU HW/Consulting_Data/Data/FIMrecalls04.txt")
+fim04 <- FIMrecalls04 %>%
+  clean_names() %>%
+  transmute(
+    case = as.character(participant_id),
+    visit_num = as.character(visit_number),
+    kcal = as.numeric(energy_kcal),
+    caloriesfromsfa = as.numeric(x_calories_from_sfa),
+    caloriesfromfat = as.numeric(x_calories_from_fat),
+    caloriesfromprotein = as.numeric(x_calories_from_protein),
+    cholesterolmg = as.numeric(cholesterol_mg),
+    totaldietaryfiberg = as.numeric(total_dietary_fiber_g),
+    magnesiummg = as.numeric(magnesium_mg),
+    calciummg = as.numeric(calcium_mg),
+    potassiummg = as.numeric(potassium_mg),
+    sodiummg = as.numeric(sodium_mg)
+  ) %>%
+  filter(case %in% rand$case, visit_num %in% names(visit_map), !is.na(kcal), kcal > 0)
+
+dash_recall <- fim04 %>%
+  mutate(
+    chol_per1000kcal = cholesterolmg / kcal * 1000,
+    fiber_per1000kcal = totaldietaryfiberg / kcal * 1000,
+    magnesium_per1000kcal = magnesiummg / kcal * 1000,
+    calcium_per1000kcal = calciummg / kcal * 1000,
+    potassium_per1000kcal = potassiummg / kcal * 1000,
+    sodium_per1000kcal = sodiummg / kcal * 1000,
+    sfa_dash = score_mellen(caloriesfromsfa, full = 6, mid = 11, direction = "low"),
+    fat_dash = score_mellen(caloriesfromfat, full = 27, mid = 32, direction = "low"),
+    protein_dash = score_mellen(caloriesfromprotein, full = 18, mid = 16.5, direction = "high"),
+    cholesterol_dash = score_mellen(chol_per1000kcal, full = 71.4, mid = 107.1, direction = "low"),
+    fiber_dash = score_mellen(fiber_per1000kcal, full = 14.8, mid = 9.5, direction = "high"),
+    magnesium_dash = score_mellen(magnesium_per1000kcal, full = 238, mid = 158, direction = "high"),
+    calcium_dash = score_mellen(calcium_per1000kcal, full = 590, mid = 402, direction = "high"),
+    potassium_dash = score_mellen(potassium_per1000kcal, full = 2238, mid = 1534, direction = "high"),
+    sodium_dash = score_mellen(sodium_per1000kcal, full = 1143, mid = 1286, direction = "low"),
+    dash_nutrient = sfa_dash + fat_dash + protein_dash + cholesterol_dash + fiber_dash +
+      magnesium_dash + calcium_dash + potassium_dash + sodium_dash,
+    visit = recode(visit_num, !!!visit_map)
+  )
+
+dash_visit <- dash_recall %>%
+  group_by(case, visit_num, visit) %>%
+  summarise(
+    dash_score = mean(dash_nutrient, na.rm = TRUE),
+    n_recalls_visit = n(),
+    dash_category = if_else(dash_score < 4.5, "Low", "High"),
+    .groups = "drop"
+  )
+
+dash_wide <- dash_visit %>%
+  select(case, visit, dash_score) %>%
+  pivot_wider(names_from = visit, values_from = dash_score) %>%
+  rename(
+    dash_bl = Baseline,
+    dash_12 = `12W`,
+    dash_24 = `24W`
+  ) %>%
+  left_join(rand %>% select(case, arm), by = "case")
+```
+
+
+# Analysis
+
+## Blood Pressure Measurements
+
+### Evaluate Missingness
+
+Is missingness of average SBP at follow-up visits related to baseline average SBP?
+
+```{r bp meas missingness}
+visit_completeness <- df %>%
+  mutate(has_sbp = !is.na(bp_avgsbp)) %>%
+  group_by(caselabel, bp_event) %>%
+  summarise(
+    has_visit = any(has_sbp),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = bp_event,
+    values_from = has_visit,
+    values_fill = FALSE
+  ) %>%
+  mutate(
+    visit_pattern = case_when(
+      Baseline & `12W` & `24W`              ~ "baseline_12w_24w",
+      Baseline & `12W` & !`24W`             ~ "baseline_12w_only",
+      Baseline & !`12W` & `24W`             ~ "baseline_24w_only",
+      Baseline & !`12W` & !`24W`            ~ "baseline_only",
+      TRUE                                  ~ "other"
+    )
+  )
+
+baseline_only <- df %>%
+  filter(bp_event == "Baseline") %>%
+  select(caselabel, baseline_sbp = bp_avgsbp) %>%
+  left_join(
+    visit_completeness %>% 
+      select(caselabel, visit_pattern),
+    by = "caselabel"
+  )
+table(baseline_only$visit_pattern)
+
+anova_model <- aov(baseline_sbp ~ visit_pattern, data = baseline_only)
+summary(anova_model)
+
+# No statistically significant difference in baseline SBP across visit-completion patterns
+# Baseline SBP does not predict who drops out or misses visits
+# Strongly supports a Missing At Random (MAR) assumption
+```
+
+
+
+### Linear Mixed Effects Model
+
+#### SBP: Combined Population
+
+```{r lme sbp combined}
+# fit a linear mixed effects model for SBP in the combined population
+m_sbp <- lmer(bp_avgsbp ~ bp_event + (1 | caselabel), data = df)
+summary(m_sbp)
+confint(m_sbp)   # CIs for baseline mean + changes vs baseline
+anova(m_sbp)     # overall time effect test
+```
+
+#### SBP: By Randomization Group
+
+```{r lme sbp by group}
+# fit a linear mixed effects model for SBP by randomization group
+m_sbp_group <- lmer(bp_avgsbp ~ bp_event * Randomization + (1 | caselabel), data = df)
+summary(m_sbp_group)
+confint(m_sbp_group)   
+anova(m_sbp_group)     
+
+# fit an estimated marginal means model to get group-specific estimates
+emm_sbp <- emmeans(m_sbp_group, ~ Randomization * bp_event)
+emm_sbp
+
+change_sbp <- contrast(
+  emm_sbp,
+  method = "trt.vs.ctrl",
+  ref = "Baseline",
+  by = "Randomization"
+)
+
+summary(change_sbp, infer = TRUE)
+
+# fit a difference-in-differences contrast to compare changes in SBP between groups
+did_sbp <- contrast(
+  emm_sbp,
+  interaction = "revpairwise"
+)
+
+summary(did_sbp, infer = TRUE)
+```
+
+#### SBP: By Medication Use
+
+```{r lme sbp by med}
+# fit a linear mixed effects model for SBP by medication use
+m_sbp_med <- lmer(bp_avgsbp ~ bp_event * bp_med + (1 | caselabel), data = df)
+summary(m_sbp_med)
+confint(m_sbp_med)
+anova(m_sbp_med)
+
+# fit an estimated marginal means model to get medication-specific estimates
+emm_sbp_med <- emmeans(m_sbp_med, ~ bp_med * bp_event)
+emm_sbp_med
+
+change_sbp_med <- contrast(
+  emm_sbp_med,
+  method = "trt.vs.ctrl",
+  ref = "Baseline",
+  by = "bp_med"
+)
+
+summary(change_sbp_med, infer = TRUE)
+
+# fit a difference-in-differences contrast to compare changes in SBP between medication groups
+did_sbp_med <- contrast(
+  emm_sbp_med,
+  interaction = "revpairwise"
+)
+
+summary(did_sbp_med, infer = TRUE)
+```
+
+#### SBP: By Randomization Group and Medication Use
+
+```{r lme sbp by group and med}
+# fit a linear mixed effects model for SBP by randomization group and medication use
+m_sbp_group_med <- lmer(bp_avgsbp ~ bp_event * Randomization + bp_med + (1 | caselabel), data = df)
+summary(m_sbp_group_med)
+confint(m_sbp_group_med)
+anova(m_sbp_group_med)
+
+# fit an estimated marginal means model to get group estimates with medication adjustment
+emm_sbp_group_med <- emmeans(m_sbp_group_med, ~ Randomization * bp_event)
+emm_sbp_group_med
+
+change_sbp_group_med <- contrast(
+  emm_sbp_group_med,
+  method = "trt.vs.ctrl",
+  ref = "Baseline",
+  by = "Randomization"
+)
+
+summary(change_sbp_group_med, infer = TRUE)
+
+# fit a difference-in-differences contrast to compare changes in SBP between groups with medication adjustment
+did_sbp_group_med <- contrast(
+  emm_sbp_group_med,
+  interaction = "revpairwise"
+)
+
+summary(did_sbp_group_med, infer = TRUE)
+```
+
+#### DBP: Combined Population
+
+```{r lme dbp combined}
+# fit a linear mixed effects model for DBP in the combined population
+m_dbp <- lmer(bp_avgdbp ~ bp_event + (1 | caselabel), data = df)
+summary(m_dbp)
+confint(m_dbp)   # CIs for baseline mean + changes vs baseline
+anova(m_dbp)     # overall time effect test
+```
+
+#### DBP: By Randomization Group
+
+```{r lme dbp by group}
+# fit a linear mixed effects model for DBP by randomization group
+m_dbp_group <- lmer(bp_avgdbp ~ bp_event * Randomization + (1 | caselabel), data = df)
+summary(m_dbp_group)
+confint(m_dbp_group)
+anova(m_dbp_group)
+
+# fit an estimated marginal means model to get group-specific estimates
+emm_dbp <- emmeans(m_dbp_group, ~ Randomization * bp_event)
+emm_dbp
+
+change_dbp <- contrast(
+  emm_dbp,
+  method = "trt.vs.ctrl",
+  ref = "Baseline",
+  by = "Randomization"
+)
+
+summary(change_dbp, infer = TRUE)
+
+# fit a difference-in-differences contrast to compare changes in DBP between groups
+did_dbp <- contrast(
+  emm_dbp,
+  interaction = "revpairwise"
+)
+
+summary(did_dbp, infer = TRUE)
+```
+
+#### DBP: By Medication Use
+
+```{r lme dbp by med}
+# fit a linear mixed effects model for DBP by medication use
+m_dbp_med <- lmer(bp_avgdbp ~ bp_event * bp_med + (1 | caselabel), data = df)
+summary(m_dbp_med)
+confint(m_dbp_med)
+anova(m_dbp_med)
+
+# fit an estimated marginal means model to get medication-specific estimates
+emm_dbp_med <- emmeans(m_dbp_med, ~ bp_med * bp_event)
+emm_dbp_med
+
+change_dbp_med <- contrast(
+  emm_dbp_med,
+  method = "trt.vs.ctrl",
+  ref = "Baseline",
+  by = "bp_med"
+)
+
+summary(change_dbp_med, infer = TRUE)
+
+# fit a difference-in-differences contrast to compare changes in DBP between medication groups
+did_dbp_med <- contrast(
+  emm_dbp_med,
+  interaction = "revpairwise"
+)
+
+summary(did_dbp_med, infer = TRUE)
+```
+
+#### DBP: By Randomization Group and Medication Use
+
+```{r lme dbp by group and med}
+# fit a linear mixed effects model for DBP by randomization group and medication use
+m_dbp_group_med <- lmer(bp_avgdbp ~ bp_event * Randomization + bp_med + (1 | caselabel), data = df)
+summary(m_dbp_group_med)
+confint(m_dbp_group_med)
+anova(m_dbp_group_med)
+
+# fit an estimated marginal means model to get group estimates with medication adjustment
+emm_dbp_group_med <- emmeans(m_dbp_group_med, ~ Randomization * bp_event)
+emm_dbp_group_med
+
+change_dbp_group_med <- contrast(
+  emm_dbp_group_med,
+  method = "trt.vs.ctrl",
+  ref = "Baseline",
+  by = "Randomization"
+)
+
+summary(change_dbp_group_med, infer = TRUE)
+
+# fit a difference-in-differences contrast to compare changes in DBP between groups with medication adjustment
+did_dbp_group_med <- contrast(
+  emm_dbp_group_med,
+  interaction = "revpairwise"
+)
+
+summary(did_dbp_group_med, infer = TRUE)
+```
+
+### Data Visualizations
+
+```{r bp plots}
+# sbp plot
+df %>%
+  group_by(bp_event, Randomization) %>%
+  summarise(
+    mean_sbp = mean(bp_avgsbp, na.rm = TRUE),
+    se_sbp   = sd(bp_avgsbp, na.rm = TRUE) / sqrt(n())
+  ) %>%
+  ggplot(aes(bp_event, mean_sbp, color = Randomization, group = Randomization)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean_sbp - se_sbp,
+                    ymax = mean_sbp + se_sbp),
+                width = 0.1) +
+  labs(
+    title = "Mean Systolic Blood Pressure Over Time by Study Arm",
+    x = "Visit",
+    y = "Mean Systolic Blood Pressure (mmHg)",
+    color = "Study Arm"
+  ) +
+  theme_minimal()
+
+sbp_12w <- df %>%
+  filter(bp_event == "12W") %>%
+  group_by(Randomization) %>%
+  summarise(mean_sbp_12w = mean(bp_avgsbp, na.rm = TRUE))
+
+sbp_24w <- df %>%
+  filter(bp_event == "24W") %>%
+  group_by(Randomization) %>%
+  summarise(mean_sbp_24w = mean(bp_avgsbp, na.rm = TRUE))
+
+# dbp plot
+df %>%
+  group_by(bp_event, Randomization) %>%
+  summarise(
+    mean_dbp = mean(bp_avgdbp, na.rm = TRUE),
+    se_dbp   = sd(bp_avgdbp, na.rm = TRUE) / sqrt(n())
+  ) %>%
+  ggplot(aes(bp_event, mean_dbp, color = Randomization, group = Randomization)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean_dbp - se_dbp,
+                    ymax = mean_dbp + se_dbp),
+                width = 0.1) +
+  labs(
+    title = "Mean Diastolic Blood Pressure Over Time by Study Arm",
+    x = "Visit",
+    y = "Mean Diastolic Blood Pressure (mmHg)",
+    Color = "Study Arm"
+  ) +
+  theme_minimal()
+```
+
+## DASH Adherence Score
+
+### Difference-in-Differences Analysis using LMM
+
+```{r dash lmm}
+# fit a linear mixed effects model for DASH adherence score by randomization group
+lmm_dash <- lmer(
+  dash ~ arm * time + (1 | case),
+  data = dash_long
+)
+
+summary(lmm_dash)
+
+# fit an estimated marginal means model to get group-specific estimates
+emm_dash <- emmeans(lmm_dash, ~ arm * time)
+
+contrast(
+  emm_dash,
+  method = "trt.vs.ctrl",
+  ref = "Baseline",
+  by = "arm"
+)
+
+summary(emm_dash, infer = TRUE)
+
+# fit a difference-in-differences contrast to compare changes in DASH adherence between groups
+did_dash <- contrast(
+  emm_dash,
+  interaction = "revpairwise"
+)
+summary(did_dash, infer = TRUE)
+```
+
+### Data Visualization
+
+```{r dash plot}
+dash_long %>%
+  mutate(
+    time = recode(time,
+                  "dash_bl" = "Baseline",
+                  "dash_12" = "12 Weeks",
+                  "dash_24" = "24 Weeks"),
+    time = factor(time, levels = c("Baseline", "12 Weeks", "24 Weeks"))
+  ) %>%
+  group_by(arm, time) %>%
+  summarise(mean_dash = mean(dash, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(time, mean_dash, color = arm, group = arm)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  labs(
+    title = "Changes in DASH Adherence Over Time by Study Arm",
+    x = "Visit",
+    y = "Mean DASH Adherence Score",
+    color = "Study Arm"
+  ) +
+  theme_minimal()
+```
