@@ -140,13 +140,28 @@ medication_visits <- bind_rows(
     rename(bp_med = bp_med_followup)
 )
 
+# add randomization data
 medication_visits <- medication_visits %>%
   mutate(
     bp_event = factor(bp_event,
                       levels = c("Baseline", "12W", "24W"))
   ) %>%
   left_join(thrive_random %>% select(caselabel, Randomization), by = "caselabel") %>%
-  filter(!is.na(Randomization))
+  filter(!is.na(Randomization)) %>%
+  arrange(caselabel, bp_event)
+
+# manually change some values for participants according to Shanshan's notes
+## 18398-125 - no 12W med
+medication_visits <- medication_visits %>%
+  mutate(
+    bp_med = ifelse(caselabel == "18398-125" & bp_event == "12W", 0, bp_med)
+  )
+
+## 18398-363 - no 24W med
+medication_visits <- medication_visits %>%
+  mutate(
+    bp_med = ifelse(caselabel == "18398-363" & bp_event == "24W", 0, bp_med)
+  )
 ```
 
 ```{r bp med cleaning 3}
