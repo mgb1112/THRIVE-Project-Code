@@ -8,3 +8,5 @@ There were three main aims:
   1. Update Table 1 with medication information
   2. Verify results with LMM Models and medication use
   3. Investigate the missingness within the data set
+
+The data of the analyses is stored in `thrive_data.rds` file.
